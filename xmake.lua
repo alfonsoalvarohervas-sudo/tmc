@@ -59,9 +59,16 @@ option_end()
 -- per-pixel shader filters (CRT, scanlines, lcd-grid, etc.) without
 -- the CPU-side approximation tradeoff. See port/port_gpu_renderer.{h,cpp}.
 option("gpu_renderer")
-    set_default(false)
+    -- Default ON: GPU (SDL_GPU) presentation is the primary path, with an
+    -- automatic SDL_Renderer software fallback (render_backend=auto tries GPU
+    -- first, falls back cleanly — see port_main.c / port_ppu.cpp). Compiling it
+    -- in everywhere means capable devices use the GPU; devices whose driver
+    -- can't provide a usable backend (e.g. an Adreno 405 GSI with a stub Vulkan
+    -- ICD) fall back to software automatically. Costs ~150 KB embedded SPIR-V.
+    -- Pass --gpu_renderer=n to compile a pure-software binary.
+    set_default(true)
     set_showmenu(true)
-    set_description("Compile the SDL_GPU presentation path (Stage 1: scaffold). Enables fragment-shader filters in future stages.")
+    set_description("Compile the SDL_GPU presentation path (default ON; auto-falls back to SDL_Renderer).")
 option_end()
 
 -- Widescreen: render the GBA frame at a non-native horizontal width by
@@ -713,6 +720,7 @@ target("tmc_pc")
     add_files("port/port_repro_roomcap.c")  -- generic in-game room capture (TMC_ROOMCAP)
     add_files("port/port_repro_roll_macro.c") -- roll-attack macro e2e test (TMC_REPRO_ROLL_MACRO)
     add_files("port/port_repro_npc_talk.c") -- NPC-talk e2e test (TMC_REPRO_NPC_TALK)
+    add_files("port/port_repro_itemget.c") -- item-get perf repro (TMC_REPRO_ITEMGET)
     -- Link the asset extractor implementation directly so tmc_pc can
     -- run extraction in-process at startup (no shell-out) and share
     -- the engine's already-loaded ROM buffer.
@@ -913,7 +921,7 @@ target("tmc_pc")
 
     -- Compiler flags
     add_cflags("-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-missing-field-initializers",
-               "-fno-strict-aliasing", "-fwrapv", "-fno-strict-overflow", "-O0", "-g",
+               "-fno-strict-aliasing", "-fwrapv", "-fno-strict-overflow", "-O3", "-g",
                "-fvisibility=default", "-funsigned-char")
 
     add_cxxflags("-Wall", "-Wextra", "-Wno-unused-parameter",

@@ -389,12 +389,35 @@ uint32_t virtuappu_mode1_io_read32(uint16_t offset) {
            ((uint32_t)virtuappu_mode1_io_read16((uint16_t)(offset + 2u)) << 16u);
 }
 
+/* Per-frame ABGR8888 palette lookup tables. The GBA palette is only 256 BG +
+ * 256 OBJ entries and is frame-constant (the fade/brightness engine rewrites
+ * palette RAM once per frame BEFORE render; the HDMA pre-line callback mutates
+ * only IO registers, never palette RAM). So converting all 512 entries once per
+ * frame and indexing them per pixel replaces the per-pixel rgb555->ABGR math
+ * (5-6 shifts/masks/ORs) with a single load — a big win on the in-order A53,
+ * with ZERO added branches. Built by PublishPaletteLuts before the parallel
+ * scanline render; SHARED read-only during it (same contract as ws_shadow).
+ * Byte-exact: LUT[i] == rgb555_to_abgr(palette[i]) by construction. */
+static uint32_t mode1_bg_abgr_lut[MODE1_PALETTE_COLORS];
+static uint32_t mode1_obj_abgr_lut[MODE1_PALETTE_COLORS];
+
 uint32_t virtuappu_mode1_rgb555_to_abgr8888(uint16_t color) {
     uint8_t r = (uint8_t)((color & 0x1Fu) << 3u);
     uint8_t g = (uint8_t)(((color >> 5u) & 0x1Fu) << 3u);
     uint8_t b = (uint8_t)(((color >> 10u) & 0x1Fu) << 3u);
 
     return 0xFF000000u | ((uint32_t)b << 16u) | ((uint32_t)g << 8u) | (uint32_t)r;
+}
+
+/* Convert the current BG + OBJ palette RAM into the ABGR8888 LUTs. Call once
+ * per frame after the palette is final (post pre-line callback) and before the
+ * parallel scanline render. */
+static void virtuappu_mode1_publish_palette_luts(void) {
+    int i;
+    for (i = 0; i < MODE1_PALETTE_COLORS; ++i) {
+        mode1_bg_abgr_lut[i] = virtuappu_mode1_rgb555_to_abgr8888(mode1_memory.bg_palette[i]);
+        mode1_obj_abgr_lut[i] = virtuappu_mode1_rgb555_to_abgr8888(mode1_memory.obj_palette[i]);
+    }
 }
 
 void virtuappu_mode1_render_text_bg_line(int bg_index, int line, uint32_t* line_buffer, uint8_t* priority_buffer) {
@@ -459,6 +482,13 @@ void virtuappu_mode1_render_text_bg_line(int bg_index, int line, uint32_t* line_
     int bg_cache_key = -1;
     Mode1TilemapEntry bg_tile_entry;
     bg_tile_entry.raw = 0u;
+    /* Per-tile derived values, recomputed only on a cache refill (tile change).
+     * Constant across a tile's 8 px, so hoisting them out of the per-pixel body
+     * removes ~5 ALU ops/pixel with zero added branches (A53-friendly). */
+    bool bg_hflip = false;
+    int bg_tpy = 0;
+    uint32_t bg_row_base = 0u;
+    size_t bg_pal_bank = 0u;
 
     for (x = 0; x < render_max_x; ++x) {
         int sample_x = x;
@@ -509,22 +539,26 @@ void virtuappu_mode1_render_text_bg_line(int bg_index, int line, uint32_t* line_
                 bg_tile_entry.raw =
                     (uint16_t)mode1_memory.vram[map_addr] | ((uint16_t)mode1_memory.vram[map_addr + 1u] << 8u);
             }
+            /* Derive per-tile constants once (pixel_y is line-invariant, so
+             * tile_pixel_y and the tile's VRAM row base are constant across its
+             * 8 columns). Byte-identical to the former per-pixel recompute. */
+            bg_hflip = mode1_tile_hflip(bg_tile_entry);
+            bg_tpy = mode1_tile_vflip(bg_tile_entry) ? (7 - pixel_y) : pixel_y;
+            if (bpp8) {
+                bg_row_base = char_base + (uint32_t)mode1_tile_index(bg_tile_entry) * 64u + (uint32_t)bg_tpy * 8u;
+            } else {
+                bg_row_base = char_base + (uint32_t)mode1_tile_index(bg_tile_entry) * 32u + (uint32_t)bg_tpy * 4u;
+            }
+            bg_pal_bank = (size_t)mode1_tile_palette(bg_tile_entry) * 16u;
         }
-        Mode1TilemapEntry tile_entry = bg_tile_entry;
-        int tile_pixel_x;
-        int tile_pixel_y;
+        int tile_pixel_x = bg_hflip ? (7 - pixel_x) : pixel_x;
         uint8_t color_index;
-        uint16_t rgb555;
-        tile_pixel_x = mode1_tile_hflip(tile_entry) ? (7 - pixel_x) : pixel_x;
-        tile_pixel_y = mode1_tile_vflip(tile_entry) ? (7 - pixel_y) : pixel_y;
 
         if (bpp8) {
-            uint32_t addr = char_base + (uint32_t)mode1_tile_index(tile_entry) * 64u + (uint32_t)tile_pixel_y * 8u +
-                            (uint32_t)tile_pixel_x;
+            uint32_t addr = bg_row_base + (uint32_t)tile_pixel_x;
             color_index = (addr < MODE1_VRAM_SIZE) ? mode1_memory.vram[addr] : 0u;
         } else {
-            uint32_t addr = char_base + (uint32_t)mode1_tile_index(tile_entry) * 32u + (uint32_t)tile_pixel_y * 4u +
-                            (uint32_t)(tile_pixel_x / 2);
+            uint32_t addr = bg_row_base + (uint32_t)(tile_pixel_x / 2);
             uint8_t packed = (addr < MODE1_VRAM_SIZE) ? mode1_memory.vram[addr] : 0u;
             color_index = (tile_pixel_x & 1) ? (packed >> 4u) : (packed & 0x0Fu);
         }
@@ -533,22 +567,16 @@ void virtuappu_mode1_render_text_bg_line(int bg_index, int line, uint32_t* line_
             continue;
         }
 
-        if (bpp8) {
-            rgb555 = mode1_memory.bg_palette[color_index];
-        } else {
-            rgb555 = mode1_memory.bg_palette[(size_t)mode1_tile_palette(tile_entry) * 16u + color_index];
-        }
+        /* Palette index into the 256-entry BG LUT (bank*16+idx for 4bpp).
+         * Widescreen reveal (x>=240) still needs the raw rgb555 to spot the
+         * 0x7C1F "unloaded" sentinel; native pixels skip that read entirely. */
+        size_t pal_idx = bpp8 ? (size_t)color_index : (bg_pal_bank + color_index);
 
-        /* Widescreen reveal: a reveal tile can reference a palette bank the
-         * engine hasn't streamed in yet (its slots hold the 0x7C1F "unloaded"
-         * sentinel) — rendering it shows magenta garbage. Skip those pixels so
-         * the composite force-blacks them: a clean edge that fills in with real
-         * colour as the palette streams in during play. */
-        if (x >= MODE1_GBA_BG_CLIP_X && (rgb555 & 0x7FFFu) == 0x7C1Fu) {
+        if (x >= MODE1_GBA_BG_CLIP_X && (mode1_memory.bg_palette[pal_idx] & 0x7FFFu) == 0x7C1Fu) {
             continue;
         }
 
-        line_buffer[x] = virtuappu_mode1_rgb555_to_abgr8888(rgb555);
+        line_buffer[x] = mode1_bg_abgr_lut[pal_idx];
         if (priority_buffer != NULL) {
             /* Dead in the frame path (composite resolves BG order from BGCNT,
              * not per-pixel priority) — callers there pass NULL to skip
@@ -707,7 +735,6 @@ void virtuappu_mode1_render_obj_line(int line, bool obj_1d, uint32_t* line_buffe
             int pixel_x;
             uint16_t tile_index;
             uint8_t color_index;
-            uint16_t rgb555;
 
             if (mosaic_x_on) {
                 /* Sample at the mosaic block's left SCREEN column; a snapped
@@ -789,13 +816,8 @@ void virtuappu_mode1_render_obj_line(int line, bool obj_1d, uint32_t* line_buffe
                 continue;
             }
 
-            if (bpp8) {
-                rgb555 = mode1_memory.obj_palette[color_index];
-            } else {
-                rgb555 = mode1_memory.obj_palette[(size_t)mode1_oam_palette(attr) * 16u + color_index];
-            }
-
-            line_buffer[screen_x] = virtuappu_mode1_rgb555_to_abgr8888(rgb555);
+            size_t pal_idx = bpp8 ? (size_t)color_index : ((size_t)mode1_oam_palette(attr) * 16u + color_index);
+            line_buffer[screen_x] = mode1_obj_abgr_lut[pal_idx];
             priority_buffer[screen_x] = priority;
             virtuappu_mode1_obj_semitrans[screen_x] = (mode1_oam_mode(attr) == 1u) ? 1u : 0u;
         }
@@ -806,7 +828,7 @@ void virtuappu_mode1_composite_line(int line, uint32_t bg_layers[MODE1_GBA_BG_CO
                                     uint8_t bg_priority[MODE1_GBA_BG_COUNT][MODE1_GBA_WIDTH],
                                     uint32_t obj_layer[MODE1_GBA_WIDTH], uint8_t obj_priority[MODE1_GBA_WIDTH],
                                     uint16_t dispcnt) {
-    uint32_t backdrop_color = virtuappu_mode1_rgb555_to_abgr8888(mode1_memory.bg_palette[0]);
+    uint32_t backdrop_color = mode1_bg_abgr_lut[0];
     bool bg_enabled[MODE1_GBA_BG_COUNT] = { (dispcnt & MODE1_DISP_BG0_ON) != 0u, (dispcnt & MODE1_DISP_BG1_ON) != 0u,
                                             (dispcnt & MODE1_DISP_BG2_ON) != 0u, (dispcnt & MODE1_DISP_BG3_ON) != 0u };
     bool obj_enabled = (dispcnt & MODE1_DISP_OBJ_ON) != 0u;
@@ -927,7 +949,6 @@ void virtuappu_mode1_composite_line(int line, uint32_t bg_layers[MODE1_GBA_BG_CO
         int bottom_layer = 5;
         bool found_top = false;
         bool found_bottom = false;
-        int priority;
 
         if (any_window) {
             win_ctrl = outside_ctrl;
@@ -958,44 +979,50 @@ void virtuappu_mode1_composite_line(int line, uint32_t bg_layers[MODE1_GBA_BG_CO
         visible_obj = (win_ctrl & 0x10u) != 0u;
         allow_sfx = (win_ctrl & 0x20u) != 0u;
 
-        for (priority = 0; priority <= 3 && !found_bottom; ++priority) {
+        /* Single merged pass over the priority-sorted bg_order, inserting OBJ at
+         * its priority slot — byte-identical layering to the former
+         * priority(0..3) x bg(0..3) double loop (up to 20 iters/pixel), but ~5
+         * iters and one loop. OBJ is emitted right before the first bg whose
+         * priority >= obj_priority[x] (GBA ties: OBJ over same-priority BG); if
+         * no such bg, OBJ is emitted after the walk. Removing per-pixel work with
+         * no added data-dependent branch is the A53-correct optimisation. */
+        {
+            bool obj_candidate = obj_enabled && visible_obj && (obj_layer[x] != 0u);
+            unsigned obj_p = obj_priority[x];
+            bool obj_emitted = false;
             int order_index;
 
-            if (obj_enabled && visible_obj && obj_layer[x] != 0u && obj_priority[x] == priority) {
-                if (!found_top) {
-                    top_color = obj_layer[x];
-                    top_layer = 4;
-                    found_top = true;
-                } else if (!found_bottom) {
-                    bottom_color = obj_layer[x];
-                    bottom_layer = 4;
-                    found_bottom = true;
-                }
-            }
+#define MODE1_CONSIDER(_color, _layer) \
+    do {                               \
+        if (!found_top) {              \
+            top_color = (_color);      \
+            top_layer = (_layer);      \
+            found_top = true;          \
+        } else {                       \
+            bottom_color = (_color);   \
+            bottom_layer = (_layer);   \
+            found_bottom = true;       \
+        }                              \
+    } while (0)
 
-            for (order_index = 0; order_index < MODE1_GBA_BG_COUNT; ++order_index) {
+            for (order_index = 0; order_index < MODE1_GBA_BG_COUNT && !found_bottom; ++order_index) {
                 int bg = bg_order[order_index];
-                if (!bg_enabled[bg] || !visible_bg[bg]) {
+                if (obj_candidate && !obj_emitted && bg_order_priority[bg] >= obj_p) {
+                    MODE1_CONSIDER(obj_layer[x], 4);
+                    obj_emitted = true;
+                    if (found_bottom) {
+                        break;
+                    }
+                }
+                if (!bg_enabled[bg] || !visible_bg[bg] || bg_layers[bg][x] == 0u) {
                     continue;
                 }
-                if (bg_order_priority[bg] != priority) {
-                    continue;
-                }
-                if (bg_layers[bg][x] == 0u) {
-                    continue;
-                }
-
-                if (!found_top) {
-                    top_color = bg_layers[bg][x];
-                    top_layer = bg;
-                    found_top = true;
-                } else if (!found_bottom) {
-                    bottom_color = bg_layers[bg][x];
-                    bottom_layer = bg;
-                    found_bottom = true;
-                    break;
-                }
+                MODE1_CONSIDER(bg_layers[bg][x], bg);
             }
+            if (obj_candidate && !obj_emitted && !found_bottom) {
+                MODE1_CONSIDER(obj_layer[x], 4);
+            }
+#undef MODE1_CONSIDER
         }
 
         if (allow_sfx) {
@@ -1338,7 +1365,7 @@ static void mode1_render_affine_bg2_line(int frame_width, int32_t ref_x, int32_t
             continue;
         }
 
-        line_buffer[x] = virtuappu_mode1_rgb555_to_abgr8888(memory.bg_palette[color_index]);
+        line_buffer[x] = mode1_bg_abgr_lut[color_index];
         if (priority_buffer != NULL) {
             priority_buffer[x] = bg_priority_value; /* see render_text_bg_line */
         }
@@ -1395,17 +1422,25 @@ void virtuappu_mode1_render_frame(const PPUMemory* ppu) {
         aff_init_y = mode1_sign_extend_28(virtuappu_mode1_io_read32(0x2Cu));
     }
 
+    /* No HDMA pre-line callback -> IO is identical on every scanline, so the
+     * per-line snapshot is redundant: skip 160x1KB of memcpy on the sequential
+     * critical path and point every thread's override straight at io_mem in the
+     * parallel loop below. Byte-exact: each snapshot equalled io_mem anyway. */
+    const bool per_line_io = (virtuappu_mode1_pre_line_callback != NULL);
     for (line = 0; line < MODE1_GBA_HEIGHT; ++line) {
-        if (virtuappu_mode1_pre_line_callback != NULL) {
+        if (per_line_io) {
             virtuappu_mode1_pre_line_callback(line);
-        }
-        memcpy(io_snapshots[line], mode1_memory.io_mem, MODE1_IO_MEM_SIZE);
-        per_line_dispcnt[line] =
+            memcpy(io_snapshots[line], mode1_memory.io_mem, MODE1_IO_MEM_SIZE);
+            per_line_dispcnt[line] =
 #ifdef TMC_N64
-            *(const uint16_t*)&io_snapshots[line][MODE1_IO_DISPCNT];
+                *(const uint16_t*)&io_snapshots[line][MODE1_IO_DISPCNT];
 #else
-            (uint16_t)io_snapshots[line][MODE1_IO_DISPCNT] | ((uint16_t)io_snapshots[line][MODE1_IO_DISPCNT + 1] << 8);
+                (uint16_t)io_snapshots[line][MODE1_IO_DISPCNT] |
+                ((uint16_t)io_snapshots[line][MODE1_IO_DISPCNT + 1] << 8);
 #endif
+        } else {
+            per_line_dispcnt[line] = dispcnt;
+        }
         if (do_affine_bg2) {
             /* Live IO is this line's post-callback state here (== the snapshot),
              * matching what the old mode2.c read inline. */
@@ -1421,6 +1456,12 @@ void virtuappu_mode1_render_frame(const PPUMemory* ppu) {
                                           virtuappu_mode1_bg2y_hdma_strobe, aff_ref_x, aff_ref_y);
     }
 
+    /* Palette RAM is final for the frame here (fade engine wrote it before this
+     * render; the pre-line callback above only touches IO regs). Convert it to
+     * the ABGR LUTs once so the parallel per-pixel loops below do a single table
+     * load instead of the rgb555->ABGR math. */
+    virtuappu_mode1_publish_palette_luts();
+
 #pragma omp parallel for schedule(static)
     for (line = 0; line < MODE1_GBA_HEIGHT; ++line) {
         /* Affine (mode 2) renders every scanline against the frame-start DISPCNT
@@ -1433,32 +1474,37 @@ void virtuappu_mode1_render_frame(const PPUMemory* ppu) {
         bool obj_1d = (line_dispcnt & MODE1_DISP_OBJ_1D) != 0u;
         const uint8_t* prev_override = virtuappu_mode1_io_thread_override;
 
-        virtuappu_mode1_io_thread_override = io_snapshots[line];
+        virtuappu_mode1_io_thread_override = per_line_io ? io_snapshots[line] : mode1_memory.io_mem;
 
-        for (int b = 0; b < MODE1_GBA_BG_COUNT; ++b) {
-            memset(bg_layers[b], 0, (size_t)mode1_frame_width * sizeof(uint32_t));
-        }
         memset(obj_layer, 0, (size_t)mode1_frame_width * sizeof(uint32_t));
         memset(obj_priority, 0xFF, (size_t)mode1_frame_width);
 
-        /* BG priority buffers are dead in this path — the composite resolves
-         * BG order from BGCNT directly (bg_order_priority); NULL skips the
-         * per-pixel stores. obj_priority IS live (OBJ-vs-BG resolution). */
+        /* Clear + render only ENABLED BGs: composite reads bg_layers[b][x] only
+         * where bg_enabled[b] (same line_dispcnt), so a disabled BG's buffer is
+         * never touched — clearing all four every line was wasted bandwidth.
+         * BG priority buffers stay NULL (composite resolves order from BGCNT). */
         if ((line_dispcnt & MODE1_DISP_BG0_ON) != 0u) {
+            memset(bg_layers[0], 0, (size_t)mode1_frame_width * sizeof(uint32_t));
             virtuappu_mode1_render_text_bg_line(0, line, bg_layers[0], NULL);
         }
         if ((line_dispcnt & MODE1_DISP_BG1_ON) != 0u) {
+            memset(bg_layers[1], 0, (size_t)mode1_frame_width * sizeof(uint32_t));
             virtuappu_mode1_render_text_bg_line(1, line, bg_layers[1], NULL);
         }
-        if (affine) {
-            if ((line_dispcnt & MODE1_DISP_BG2_ON) != 0u) {
+        if ((line_dispcnt & MODE1_DISP_BG2_ON) != 0u) {
+            memset(bg_layers[2], 0, (size_t)mode1_frame_width * sizeof(uint32_t));
+            if (affine) {
                 mode1_render_affine_bg2_line(frame_width, aff_ref_x[line], aff_ref_y[line], bg_layers[2], NULL);
-            }
-        } else {
-            if ((line_dispcnt & MODE1_DISP_BG2_ON) != 0u) {
+            } else {
                 virtuappu_mode1_render_text_bg_line(2, line, bg_layers[2], NULL);
             }
-            if ((line_dispcnt & MODE1_DISP_BG3_ON) != 0u) {
+        }
+        if ((line_dispcnt & MODE1_DISP_BG3_ON) != 0u) {
+            /* Mode 2 (affine) has no BG3 tile render, but if DISPCNT enables it
+             * the composite still reads bg_layers[3]; keep it cleared to 0 so it
+             * contributes nothing — exactly as the old unconditional memset did. */
+            memset(bg_layers[3], 0, (size_t)mode1_frame_width * sizeof(uint32_t));
+            if (!affine) {
                 virtuappu_mode1_render_text_bg_line(3, line, bg_layers[3], NULL);
             }
         }

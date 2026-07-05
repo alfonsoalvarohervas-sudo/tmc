@@ -58,7 +58,7 @@ const std::array<Def, PORT_INPUT_COUNT> kDefaults = { {
 u8 sScale = 3;
 u8 sInternalScale = 1;
 std::string sUpscaleMethod = "nearest";
-u64 sFrameTimeNs = 0;
+u64 sFrameTimeNs = 1000000000ULL / 60; /* 60 FPS cap by default (VSync-effective); see kDefaultFrameTimeNs */
 bool sPortSettingsMenuEnabled = true;
 /* Persisted active save-profile filename. Defaults to tmc.sav. The
  * port_save.c EEPROM emulation reads/writes this path; the F8 debug
@@ -75,11 +75,15 @@ u32 sAutosaveIntervalMs = 60000;
 PortTouchScheme sTouchScheme = PORT_TOUCH_SCHEME_JOYSTICK;
 float sTouchScale = 1.0f;   /* multiplies the touch layout unit  */
 float sTouchOpacity = 1.0f; /* multiplies every control's alpha  */
-/* Widescreen reveal default-ON since the dialogue-centering + overlay
- * fallback pass (2026-07-02): wide builds now degrade gracefully in every
- * verified scenario (dialogue, choices, prologue, pause, narrow rooms).
- * Console-Parity still forces this off; native-240 builds ignore it. */
+/* Widescreen reveal default-ON for desktop, OFF for Android. Widescreen
+ * draws ~60% more scanline pixels (384x160 vs 240x160), which crushes
+ * low-end ARM chips. Console-Parity still forces this off; native-240
+ * builds ignore it. */
+#ifdef __ANDROID__
+bool sWidescreenEnabled = false;
+#else
 bool sWidescreenEnabled = true;
+#endif
 /* Console-Parity mode. When true the port suppresses every feature that
  * gives the player an edge over real GBA hardware, so a run is provably
  * console-equivalent: sub-frame input edge leniency off, save-states inert,
@@ -119,8 +123,12 @@ float sPracticeSlowmo = 1.0f;
 /* Runtime toggles that previously lived only in memory (issue #146): they
  * now persist to config.json and are re-applied at startup. */
 bool sDiscordRpc = false;
-bool sVSyncCfg = true;         /* matches Port_PPU's sVSyncEnabled default */
-bool sColorCorrect = true;     /* GBA-LCD colour correction (default on) */
+bool sVSyncCfg = true; /* matches Port_PPU's sVSyncEnabled default */
+#ifdef __ANDROID__
+bool sColorCorrect = false; /* Too heavy for low-end ARM by default */
+#else
+bool sColorCorrect = true; /* GBA-LCD colour correction (default on) */
+#endif
 bool sLcdPersist = false;      /* LCD temporal persistence (default off) */
 float sLcdPersistRho = 0.35f;  /* persistence: fraction of prev frame kept */
 bool sRibbonCfg = true;        /* F8 menu style: ribbon (true) vs classic */
@@ -214,7 +222,11 @@ struct ScaleCfg {
 const BoolCfg kBoolCfg[] = {
     { "port_settings_menu", &sPortSettingsMenuEnabled, true },
     { "autosave_enabled", &sAutosaveEnabled, true },
+#ifdef __ANDROID__
+    { "widescreen_enabled", &sWidescreenEnabled, false },
+#else
     { "widescreen_enabled", &sWidescreenEnabled, true },
+#endif
     { "console_parity", &sConsoleParity, false },
     { "tts_enabled", &sTtsEnabled, true },
     { "a11y_cues", &sA11yCues, true },
@@ -227,7 +239,11 @@ const BoolCfg kBoolCfg[] = {
     { "practice_show_history", &sPracticeShowHistory, false },
     { "discord_rpc", &sDiscordRpc, false },
     { "vsync", &sVSyncCfg, true },
+#ifdef __ANDROID__
+    { "color_correction", &sColorCorrect, false },
+#else
     { "color_correction", &sColorCorrect, true },
+#endif
     { "lcd_persistence", &sLcdPersist, false },
     { "ribbon_mode", &sRibbonCfg, true },
     { "hold_advance_text", &sHoldAdvanceText, false },
@@ -577,10 +593,13 @@ extern "C" void Port_Config_Load(const char* path) {
             int v = j.value(e.key, e.def);
             *e.var = (v >= e.lo && v <= e.hi) ? (u8)v : (u8)e.def;
         }
-        /* frame_time_ns: apply default (0 = uncapped) differs from
-         * DefaultsJson's 60 FPS cap on purpose — a missing key means
-         * uncapped, a fresh config gets the cap. Kept inline for that. */
-        sFrameTimeNs = j.value("frame_time_ns", 0ULL);
+        /* frame_time_ns: a MISSING key now defaults to the 60 FPS cap (same as
+         * DefaultsJson) so VSync is enforced by default — an uncapped default
+         * makes Port_Config_TargetFps()==0, which port_bios.c treats as "must
+         * disable VSync" (can't sync above the panel), silently defeating it.
+         * An explicit frame_time_ns:0 in the config is still honoured as a
+         * deliberate uncapped/VSync-off opt-out (the key is present). */
+        sFrameTimeNs = j.value("frame_time_ns", kDefaultFrameTimeNs);
         sAutosaveIntervalMs = j.value("autosave_interval_ms", 60000u); // ponytail: lone u32, not worth a table
         {
             std::string ts = j.value("touch_scheme", std::string("joystick"));

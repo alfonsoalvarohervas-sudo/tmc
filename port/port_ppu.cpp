@@ -653,8 +653,19 @@ extern "C" void Port_PPU_Init(SDL_Window* window) {
             n = atoi(force);
         } else if (getenv("OMP_NUM_THREADS") == nullptr) {
             n = omp_get_num_procs() - 1;
+#ifdef __ANDROID__
+            /* On 8-core mobile SoCs (big.LITTLE), spawning 6 or 7 threads forces
+             * heavy scanline rendering onto the slow LITTLE cores. The OpenMP barrier
+             * then waits for them, effectively slowing the entire render pipeline
+             * down to the speed of the slowest core, while maxing out thermals.
+             * Cap to 3 threads on Android to stay within the big cluster (leaves 1
+             * big core for the main thread/audio). */
+            if (n > 3)
+                n = 3;
+#else
             if (n > 6)
                 n = 6;
+#endif
         }
         if (n >= 1) {
             omp_set_num_threads(n);
@@ -717,6 +728,8 @@ extern "C" void Port_PPU_Init(SDL_Window* window) {
     if (!sRenderer) {
         printf("Port_PPU_Init: SDL_CreateRenderer failed: %s\n", SDL_GetError());
     } else {
+        const char* rname = SDL_GetRendererName(sRenderer);
+        std::fprintf(stderr, "PPU: SDL_Renderer driver = %s\n", rname ? rname : "?");
         if (!SDL_SetRenderVSync(sRenderer, 1)) {
             printf("Port_PPU_Init: SDL_SetRenderVSync failed: %s\n", SDL_GetError());
         }
