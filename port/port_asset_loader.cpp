@@ -1006,7 +1006,11 @@ bool BuildAreaFromAssets(u32 area) {
              * sees the GBA-original contiguous layout. (Both were
              * dropped during the PR #60 merge; restored.) */
             u8* romPtr = nullptr;
-            if (gRomData != nullptr) {
+            ScanMods();
+            const std::string normalizedPropPath = NormalizeAssetPath(roomEntry.files[i]);
+            bool hasModProp = (gAssetGroupCache.modReplacements.find(normalizedPropPath) != gAssetGroupCache.modReplacements.end());
+
+            if (!hasModProp && gRomData != nullptr) {
                 const std::string& path = roomEntry.files[i];
 
                 /* Path (a): filename-encoded hex offset. */

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- TMC Level Editor: Merged ground and overhead layers into a single "Tilemap" mode in the top ribbon, streamlined the Inspector panel by removing the redundant tab selector, and added per-layer visibility toggles for BG1 and BG2.
+
 - Sitting NPC dialogue updates the intended script condition without
   overwriting wait-state fields on 64-bit PC builds.
 

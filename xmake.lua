@@ -513,6 +513,21 @@ task("build_assets")
 task_end()
 
 -- ====================
+-- TMC Level Editor Target
+-- ====================
+target("tmc_editor")
+    set_kind("binary")
+    set_targetdir("build/pc")
+    set_languages("c11", "cxx20")
+    add_packages("libsdl3", "imgui", "nlohmann_json", "fmt")
+    if is_plat("mingw", "windows") then
+        add_packages("libpng", "zlib")
+        add_mingw_static_cpp_runtime()
+    end
+    add_includedirs("include", "port", "tools/tmc_editor/src")
+    add_files("tools/tmc_editor/src/**.cpp")
+
+-- ====================
 -- PC Port Target
 -- ====================
 target("tmc_pc")
