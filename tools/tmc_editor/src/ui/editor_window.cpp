@@ -15,18 +15,21 @@ bool EditorWindow::init(SDL_Renderer* renderer) {
     if (!m_tileRenderer.init(renderer)) {
         return false;
     }
+    m_entityStudio.init(renderer, &m_romReader);
 
     // Auto-probe common ROM paths
     const std::vector<std::string> romCandidates = {
         "baserom.gba",
         "baserom_eu.gba",
         "../../baserom.gba",
+        "dist/USA/baserom.gba",
         "build/pc/baserom.gba"
     };
 
     for (const auto& path : romCandidates) {
         if (fs::exists(path) && m_romReader.loadRom(path)) {
             m_statusMessage = "Loaded ROM: " + path;
+            m_entityStudio.setRomReader(&m_romReader);
             
             // Check if an autosaved project exists to restore previous session
             if (fs::exists("autosave.tmcproj") && m_projectManager.loadProject("autosave.tmcproj")) {
@@ -131,6 +134,20 @@ void EditorWindow::updateAndRender() {
     if (ImGui::Button("+", ImVec2(24, 26)) && m_renderOptions.zoom < 5.0f) {
         m_renderOptions.zoom = std::min(5.0f, m_renderOptions.zoom + 0.5f);
     }
+    ImGui::SameLine();
+    ImGui::TextDisabled("|");
+    ImGui::SameLine();
+
+    // Entity Studio Quick Access Button
+    if (m_showEntityStudio) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.15f, 0.9f));
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.35f, 0.35f, 0.70f, 0.9f));
+    }
+    if (ImGui::Button("Entity Studio (F6)", ImVec2(140, 28))) {
+        m_showEntityStudio = !m_showEntityStudio;
+    }
+    ImGui::PopStyleColor();
 
     ImGui::SameLine(displaySize.x - 280);
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.60f, 0.25f, 0.9f));
@@ -189,6 +206,11 @@ void EditorWindow::updateAndRender() {
     }
 
     ImGui::End();
+
+    // Render Entity Studio (Dedicated Custom Entity & Visual Behavior Designer Window)
+    if (m_showEntityStudio) {
+        m_entityStudio.render(&m_showEntityStudio);
+    }
 }
 
 void EditorWindow::renderMainMenuBar() {
@@ -240,6 +262,13 @@ void EditorWindow::renderMainMenuBar() {
             ImGui::Separator();
             ImGui::SliderFloat("Zoom Level", &m_renderOptions.zoom, 0.5f, 5.0f, "%.1fx");
             ImGui::SliderFloat("Collision Alpha", &m_renderOptions.collisionOpacity, 0.1f, 1.0f);
+            ImGui::EndMenu();
+        }
+
+        if (ImGui::BeginMenu("Tools")) {
+            if (ImGui::MenuItem("TMC Entity Studio (Custom Entities & Behavior)", "F6", m_showEntityStudio)) {
+                m_showEntityStudio = !m_showEntityStudio;
+            }
             ImGui::EndMenu();
         }
 

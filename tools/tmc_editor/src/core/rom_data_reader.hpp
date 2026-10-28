@@ -28,6 +28,7 @@ public:
     bool isLoaded() const { return !m_romBytes.empty(); }
 
     size_t getRomSize() const { return m_romBytes.size(); }
+    const std::vector<u8>& getRomBytes() const { return m_romBytes; }
     const std::string& getRomPath() const { return m_romPath; }
     const RomOffsets& getOffsets() const { return m_offsets; }
 

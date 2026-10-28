@@ -5,6 +5,7 @@
 #include "core/rom_data_reader.hpp"
 #include "core/project_manager.hpp"
 #include "renderer/tile_renderer.hpp"
+#include "ui/entity_studio_window.hpp"
 #include <SDL3/SDL.h>
 #include <imgui.h>
 #include <string>
@@ -59,6 +60,10 @@ private:
     bool           m_isDraggingTransition = false;
     bool           m_hasPendingFocus = false;
     ImVec2         m_pendingFocusPos = ImVec2(0, 0);
+
+    // Entity Studio Window (Custom Entity & Visual Behavior Designer)
+    bool               m_showEntityStudio = false;
+    EntityStudioWindow m_entityStudio;
 
 
     // Sub-window renderers
